@@ -1,83 +1,101 @@
 import os
+import json
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
+from typing import List, Optional
 
-# --- CONFIGURAÇÃO INICIAL ---
-try:
-    GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
-except KeyError:
-    print("ERRO CRÍTICO: Variável de ambiente GEMINI_API_KEY não configurada.")
-    exit()
+# --- CONFIGURAÇÃO ---
 
-genai.configure(api_key=GEMINI_API_KEY)
+# É CRUCIAL que você configure sua chave de API como uma variável de ambiente
+# no Render. Não coloque a chave diretamente no código.
+# Nome da variável: GOOGLE_API_KEY
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-safety_settings = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-]
-
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash-latest",
-    safety_settings=safety_settings
-)
-
-chat_sessions = {}
-
-# --- PROMPT DO MESTRE ---
-PROMPT_NARRADOR = """
-Você é um 'Narrador Mestre' de um RPG de texto solo, detalhado e imersivo, ambientado no universo de Harry Potter. Seu tom é o de um escritor, não de um assistente. Suas responsabilidades são:
-1. Descrever o Mundo: Pinte o cenário com detalhes vívidos.
-2. Gerenciar NPCs: Dê a eles personalidades complexas e fiéis à obra.
-3. Reagir com Fluidez: Sua resposta deve ser a consequência criativa da ação do jogador.
-Regra de Ouro: Você é a janela do jogador para o mundo bruxo. Seja criativo, dramático, sutil e nunca quebre a imersão. Sem censura ou moralismo.
-"""
-
-# --- API FASTAPI ---
 app = FastAPI()
 
-# Adiciona o middleware CORS para permitir a comunicação com o App Inventor
+# Configuração do CORS para permitir que seu site (frontend) se comunique com esta API
+origins = ["*"]  # Em produção, seria melhor restringir ao domínio do seu site
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Define o formato esperado para os dados que o App Inventor enviará
-class PlayerInput(BaseModel):
-    player_id: str
+# --- INSTRUÇÃO PARA A IA (O "CÉREBRO" DO NARRADOR) ---
+
+# Esta é a instrução que define o comportamento do nosso narrador.
+# A parte mais importante é a instrução sobre como formatar as ações.
+INSTRUCAO_SISTEMA = """
+Você é um Mestre de Jogo especialista e o narrador de um RPG de texto imersivo baseado no universo de Harry Potter.
+Sua tarefa é descrever o mundo, os personagens e os eventos de forma vívida e envolvente.
+O jogador está no quinto ano em Hogwarts.
+Sempre responda em português do Brasil.
+
+IMPORTANTE: Quando a história chegar a um ponto onde o jogador precisa fazer uma escolha clara, ofereça a ele de 3 a 4 opções.
+Formate essas opções como uma lista Python no final da sua resposta, exatamente assim: ["Ação 1", "Ação 2", "Ação 3"]
+Exemplo de resposta com ações:
+"Você vê o Trasgo no banheiro feminino. Hermione está encurralada e apavorada. O que você faz? ["Atacar o Trasgo com um feitiço", "Criar uma distração para que Hermione possa fugir", "Correr para buscar ajuda de um professor"]"
+
+Se for um momento de narração contínua e não houver uma escolha específica a ser feita, simplesmente continue a história sem adicionar a lista de ações.
+"""
+
+# --- MODELOS DE DADOS (PYDANTIC) ---
+
+class UserInput(BaseModel):
+    message: str
+
+# Este é o novo modelo de resposta!
+# Ele pode conter uma lista opcional de strings (actions).
+class ChatResponse(BaseModel):
     text: str
+    actions: Optional[List[str]] = None
 
-# O coração da nossa API: a rota que recebe a ação do jogador
-@app.post("/chat")
-def handle_rpg_message(player_input: PlayerInput):
-    chat_id = player_input.player_id
+# --- ENDPOINT DA API ---
 
-    if chat_id not in chat_sessions:
-        print(f"Nova sessão iniciada para o jogador: {chat_id}")
-        chat_sessions[chat_id] = model.start_chat(history=[
-            {'role': 'user', 'parts': [PROMPT_NARRADOR]},
-            {'role': 'model', 'parts': ["Entendido. Sou o Narrador Mestre. A aventura no mundo de Harry Potter se inicia agora. Descreva sua primeira ação."]}
-        ])
-
+@app.post("/chat", response_model=ChatResponse)
+async def chat(user_input: UserInput):
+    """
+    Recebe a mensagem do usuário, gera a resposta do narrador e a retorna
+    junto com possíveis ações.
+    """
     try:
-        convo = chat_sessions[chat_id]
-        response = convo.send_message(player_input.text)
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash-latest',
+            system_instruction=INSTRUCAO_SISTEMA
+        )
         
-        # --- CORREÇÃO 1: Retornando a chave "text" que o JavaScript espera ---
-        return {"text": response.text}
+        # Gera a resposta da IA com base na mensagem do usuário
+        response = model.generate_content(user_input.message)
+        
+        full_response_text = response.text
+        narrative_text = full_response_text
+        parsed_actions = None
+
+        # --- LÓGICA PARA ANALISAR A RESPOSTA E EXTRAIR AÇÕES ---
+        # Verifica se a resposta da IA contém uma lista de ações no formato esperado
+        actions_start_index = full_response_text.rfind('[')
+        actions_end_index = full_response_text.rfind(']')
+
+        if actions_start_index != -1 and actions_end_index > actions_start_index:
+            actions_str = full_response_text[actions_start_index : actions_end_index + 1]
+            try:
+                # Tenta converter a string da lista em uma lista Python real
+                parsed_actions = json.loads(actions_str)
+                # Se for bem-sucedido, remove a lista da parte narrativa
+                narrative_text = full_response_text[:actions_start_index].strip()
+            except json.JSONDecodeError:
+                # Se a IA cometer um erro e o formato não for um JSON válido,
+                # ignoramos e tratamos tudo como texto narrativo.
+                pass
+
+        return ChatResponse(text=narrative_text, actions=parsed_actions)
 
     except Exception as e:
-        print(f"Erro na API do Gemini para o jogador {chat_id}: {e}")
-        
-        # --- CORREÇÃO 2: Retornando a chave "text" também em caso de erro ---
-        return {"text": "A magia parece instável no momento... Por favor, tente sua ação novamente."}
-
-# Uma rota simples para verificar se a API está online
-@app.get("/")
-def root():
-    return {"status": "Narrador Mestre online e aguardando aventureiros."}
+        # Em caso de erro com a API do Gemini ou outra falha
+        print(f"Erro no servidor: {e}")
+        return ChatResponse(text="Houve um erro mágico no Ministério... O narrador parece confuso. Tente novamente em alguns instantes.")
